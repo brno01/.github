@@ -44,6 +44,7 @@ Inputs:
 | Input | Default | Meaning |
 |---|---|---|
 | `semgrep-config` | `p/default` | Semgrep rule set. |
+| `semgrep-severity` | `ERROR` | Lowest semgrep severity that fails the scan. Lower findings are listed in the log. |
 | `shellcheck-severity` | `warning` | Lowest shellcheck severity that fails the scan. |
 | `report-only` | `false` | Show findings in the summary without failing the job. |
 | `open-issue` | `true` | Open or update the `security-scan` issue. |

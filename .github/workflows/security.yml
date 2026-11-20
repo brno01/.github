@@ -18,6 +18,10 @@ on:
         description: Semgrep rule set (registry id or path inside the repository).
         type: string
         default: p/default
+      semgrep-severity:
+        description: Minimum semgrep severity that fails the scan (ERROR, WARNING, INFO). Lower ones are only listed.
+        type: string
+        default: ERROR
       shellcheck-severity:
         description: Minimum shellcheck severity that fails the scan (error, warning, info, style).
         type: string
@@ -127,7 +131,28 @@ jobs:
         continue-on-error: true
         env:
           SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
-        run: semgrep scan --config "$SEMGREP_CONFIG" --error --metrics off --quiet .
+          SEMGREP_SEVERITY: ${{ inputs.semgrep-severity }}
+        run: |
+          set -uo pipefail
+          # One run lists every finding; only the ones at or above the threshold fail the scan.
+          semgrep scan --config "$SEMGREP_CONFIG" --metrics off --quiet --json --output "$RUNNER_TEMP/semgrep.json" . || true
+          python3 - "$RUNNER_TEMP/semgrep.json" "$SEMGREP_SEVERITY" <<'PY'
+          import json
+          import sys
+
+          # Unknown severities count as the highest, so a new label cannot slip through.
+          rank = {"INFO": 0, "LOW": 0, "WARNING": 1, "MEDIUM": 1, "ERROR": 2, "HIGH": 2, "CRITICAL": 2}
+          threshold = rank[sys.argv[2].upper()]
+          results = json.load(open(sys.argv[1])).get("results", [])
+          blocking = 0
+          for r in sorted(results, key=lambda r: (-rank.get(r["extra"]["severity"], 2), r["path"], r["start"]["line"])):
+              severity = r["extra"]["severity"]
+              fails = rank.get(severity, 2) >= threshold
+              blocking += fails
+              print(f"{'FAIL' if fails else 'note'} {severity:8} {r['check_id']} {r['path']}:{r['start']['line']}")
+          print(f"{len(results)} findings, {blocking} at or above {sys.argv[2].upper()}")
+          sys.exit(1 if blocking else 0)
+          PY
 
       - name: Shell (shellcheck)
         id: shellcheck
@@ -137,6 +162,7 @@ jobs:
         run: |
           set -uo pipefail
           # Tracked files whose first line is a sh, bash, dash or ksh shebang.
+          # shellcheck disable=SC2016
           mapfile -t files < <(git ls-files -z | xargs -0 -r awk 'FNR == 1 { if ($0 ~ /^#!.*[\/ ](ba|da|k)?sh( |$)/) print FILENAME; nextfile }')
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no shell scripts found"
@@ -234,7 +260,7 @@ jobs:
           number=$(gh issue list --repo "$REPO" --state open --label security-scan --json number --jq '.[0].number // empty')
           if [ "$FAILED" = true ] || [ "$SCAN_RESULT" = failure ]; then
             # The findings stay in the run log; the issue only names the scanners and links the run.
-            body=$(printf 'The security scan is failing on the default branch.\n\nFailing scanners: %s\n\nLatest run: %s\n\nThis issue is updated by the `security` workflow and closes itself when the scan passes again.\n' "${DETAILS:-see the run}" "$RUN_URL")
+            body=$(printf 'The security scan is failing on the default branch.\n\nFailing scanners: %s\n\nLatest run: %s\n\nThis issue is updated by the security workflow and closes itself when the scan passes again.\n' "${DETAILS:-see the run}" "$RUN_URL")
             if [ -n "$number" ]; then
               gh issue edit "$number" --repo "$REPO" --body "$body"
             else
