@@ -1,0 +1,26 @@
+name: security
+
+# Copy to .github/workflows/security.yml. Change the branch name if the default
+# branch is not master, and move the cron minute so repositories do not all run
+# at the same time.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    permissions:
+      contents: read
+      issues: write
+    uses: brno01/.github/.github/workflows/security.yml@v1

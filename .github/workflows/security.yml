@@ -1,0 +1,246 @@
+name: security
+
+# Reusable security scan. One job on purpose: every scanner runs on the same
+# runner so a private repository spends about two billed minutes per run.
+#
+# Caller (see templates/security.yml):
+#   jobs:
+#     security:
+#       permissions:
+#         contents: read
+#         issues: write
+#       uses: brno01/.github/.github/workflows/security.yml@v1
+
+on:
+  workflow_call:
+    inputs:
+      semgrep-config:
+        description: Semgrep rule set (registry id or path inside the repository).
+        type: string
+        default: p/default
+      shellcheck-severity:
+        description: Minimum shellcheck severity that fails the scan (error, warning, info, style).
+        type: string
+        default: warning
+      report-only:
+        description: Report findings in the summary without failing the job.
+        type: boolean
+        default: false
+      open-issue:
+        description: Open or update a security-scan issue when the default branch fails.
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      failed: ${{ steps.gate.outputs.failed }}
+      details: ${{ steps.gate.outputs.details }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install scanners
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          OSV_VERSION: 2.7.1
+          OSV_SHA256: fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          SEMGREP_VERSION: 1.186.0
+          ZIZMOR_VERSION: 1.32.0
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/scanners"
+          mkdir -p "$bin"
+          fetch() { # <url> <sha256> <file>
+            curl -fsSL --retry 3 -o "$3" "$1"
+            echo "$2  $3" | sha256sum -c -
+          }
+          fetch "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            "$GITLEAKS_SHA256" "$RUNNER_TEMP/gitleaks.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$bin" gitleaks
+          fetch "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64" \
+            "$OSV_SHA256" "$bin/osv-scanner"
+          chmod +x "$bin/osv-scanner"
+          fetch "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            "$ACTIONLINT_SHA256" "$RUNNER_TEMP/actionlint.tar.gz"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$bin" actionlint
+          pipx install --quiet "semgrep==${SEMGREP_VERSION}"
+          pipx install --quiet "zizmor==${ZIZMOR_VERSION}"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Secrets (gitleaks)
+        id: gitleaks
+        continue-on-error: true
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          # Pull request and push: only the new commits. Schedule and manual run: the whole history.
+          range=""
+          case "$EVENT" in
+            pull_request)
+              range="${PR_BASE}..${PR_HEAD}" ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && ! [[ "$PUSH_BEFORE" =~ ^0+$ ]] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                range="${PUSH_BEFORE}..${PUSH_AFTER}"
+              fi ;;
+          esac
+          if [ -n "$range" ]; then
+            gitleaks git --redact --no-banner --log-opts="$range" .
+          else
+            gitleaks git --redact --no-banner .
+          fi
+
+      - name: Dependencies (osv-scanner)
+        id: osv
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          rc=0
+          osv-scanner scan source --recursive . || rc=$?
+          # 128: no lockfile or manifest found, which is not a failure.
+          if [ "$rc" -eq 128 ]; then
+            echo "no dependency manifests found"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Static analysis (semgrep)
+        id: semgrep
+        continue-on-error: true
+        env:
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+        run: semgrep scan --config "$SEMGREP_CONFIG" --error --metrics off --quiet .
+
+      - name: Shell (shellcheck)
+        id: shellcheck
+        continue-on-error: true
+        env:
+          SEVERITY: ${{ inputs.shellcheck-severity }}
+        run: |
+          set -uo pipefail
+          # Tracked files whose first line is a sh, bash, dash or ksh shebang.
+          mapfile -t files < <(git ls-files -z | xargs -0 -r awk 'FNR == 1 { if ($0 ~ /^#!.*[\/ ](ba|da|k)?sh( |$)/) print FILENAME; nextfile }')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no shell scripts found"
+            exit 0
+          fi
+          echo "checking ${#files[@]} shell scripts"
+          shellcheck --severity="$SEVERITY" -- "${files[@]}"
+
+      - name: Workflows (actionlint, zizmor)
+        id: workflows
+        continue-on-error: true
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          if [ ! -d .github/workflows ]; then
+            echo "no workflows found"
+            exit 0
+          fi
+          rc=0
+          actionlint || rc=1
+          # Default policy when the repository has no zizmor.yml of its own: third-party
+          # actions pinned to a commit; this account's own reusable workflows may use a tag.
+          config=()
+          if [ ! -f zizmor.yml ] && [ ! -f .github/zizmor.yml ]; then
+            printf '%s\n' 'rules:' '  unpinned-uses:' '    config:' '      policies:' \
+              "        \"${OWNER}/*\": ref-pin" '        "*": hash-pin' > "$RUNNER_TEMP/zizmor.yml"
+            config=(--config "$RUNNER_TEMP/zizmor.yml")
+          fi
+          zizmor --offline --min-severity medium "${config[@]}" . || rc=1
+          exit "$rc"
+
+      - name: Result
+        id: gate
+        env:
+          REPORT_ONLY: ${{ inputs.report-only }}
+          R_GITLEAKS: ${{ steps.gitleaks.outcome }}
+          R_OSV: ${{ steps.osv.outcome }}
+          R_SEMGREP: ${{ steps.semgrep.outcome }}
+          R_SHELLCHECK: ${{ steps.shellcheck.outcome }}
+          R_WORKFLOWS: ${{ steps.workflows.outcome }}
+        run: |
+          set -euo pipefail
+          failed=""
+          {
+            echo "| Scanner | Result |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          row() { # <label> <outcome>
+            echo "| $1 | $2 |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$2" != success ]; then failed="${failed:+$failed, }$1"; fi
+          }
+          row "Secrets (gitleaks)" "$R_GITLEAKS"
+          row "Dependencies (osv-scanner)" "$R_OSV"
+          row "Static analysis (semgrep)" "$R_SEMGREP"
+          row "Shell (shellcheck)" "$R_SHELLCHECK"
+          row "Workflows (actionlint, zizmor)" "$R_WORKFLOWS"
+          if [ -z "$failed" ]; then
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "details=$failed" >> "$GITHUB_OUTPUT"
+          echo "::error::failing scanners: $failed"
+          if [ "$REPORT_ONLY" = true ]; then
+            echo "report-only mode: not failing the job"
+            exit 0
+          fi
+          exit 1
+
+  issue:
+    name: issue
+    needs: scan
+    # Only for the default branch and the weekly run: a pull request shows its own failure.
+    if: >-
+      ${{ always() && inputs.open-issue && needs.scan.result != 'cancelled' && needs.scan.result != 'skipped' &&
+      (github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the security-scan issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FAILED: ${{ needs.scan.outputs.failed }}
+          DETAILS: ${{ needs.scan.outputs.details }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+        run: |
+          set -euo pipefail
+          number=$(gh issue list --repo "$REPO" --state open --label security-scan --json number --jq '.[0].number // empty')
+          if [ "$FAILED" = true ] || [ "$SCAN_RESULT" = failure ]; then
+            # The findings stay in the run log; the issue only names the scanners and links the run.
+            body=$(printf 'The security scan is failing on the default branch.\n\nFailing scanners: %s\n\nLatest run: %s\n\nThis issue is updated by the `security` workflow and closes itself when the scan passes again.\n' "${DETAILS:-see the run}" "$RUN_URL")
+            if [ -n "$number" ]; then
+              gh issue edit "$number" --repo "$REPO" --body "$body"
+            else
+              gh label create security-scan --repo "$REPO" --color B60205 --description "Opened by the security workflow" 2>/dev/null || true
+              gh issue create --repo "$REPO" --label security-scan --title "Security scan is failing on the default branch" --body "$body"
+            fi
+          elif [ -n "$number" ]; then
+            gh issue close "$number" --repo "$REPO" --comment "The security scan passes again: $RUN_URL"
+          fi

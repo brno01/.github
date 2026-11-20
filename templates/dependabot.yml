@@ -1,0 +1,11 @@
+# Copy to .github/dependabot.yml. Add one block per package ecosystem the
+# repository really uses (npm, pip, cargo, ...).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

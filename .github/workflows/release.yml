@@ -1,0 +1,60 @@
+name: release
+
+# Reusable release. The caller runs it on a version tag (see templates/release.yml).
+# It creates the GitHub Release for that tag with generated notes and, when asked,
+# builds and attaches files.
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: Optional command that produces the files to attach. Runs with bash from the repository root.
+        type: string
+        default: ""
+      assets:
+        description: Optional space-separated list of files to attach, relative to the repository root.
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  release:
+    name: release
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build
+        if: ${{ inputs.build-command != '' }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: bash -euo pipefail -c "$BUILD_COMMAND"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ASSETS: ${{ inputs.assets }}
+        run: |
+          set -euo pipefail
+          files=()
+          if [ -n "$ASSETS" ]; then
+            read -r -a files <<< "$ASSETS"
+          fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists"
+            if [ "${#files[@]}" -gt 0 ]; then
+              gh release upload "$TAG" --clobber -- "${files[@]}"
+            fi
+            exit 0
+          fi
+          gh release create "$TAG" --verify-tag --generate-notes -- "${files[@]}"

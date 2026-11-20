@@ -1,0 +1,16 @@
+name: release
+
+# Copy to .github/workflows/release.yml. Pushing a tag such as v1.2.3 creates the
+# GitHub Release with generated notes.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: brno01/.github/.github/workflows/release.yml@v1
